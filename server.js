@@ -144,7 +144,7 @@ Rispondi SOLO con JSON valido (nessun testo fuori, nessun markdown):
 DATE: oggi=${td}, domani=${fmtDate(addDays(now,1))}, dopodomani=${fmtDate(addDays(now,2))}, lunedì=${nextDow(1)}, martedì=${nextDow(2)}, mercoledì=${nextDow(3)}, giovedì=${nextDow(4)}, venerdì=${nextDow(5)}
 Se manca data usa domani. Se manca cliente usa "Generale". Se manca priorità usa "media".`;
   try {
-    const resp = await anthropic.messages.create({ model:"claude-opus-4-5", max_tokens:1024, system:systemPrompt, messages:[...(history||[]).slice(-6),{role:"user",content:message}] });
+    const resp = await anthropic.messages.create({ model:"claude-opus-4-5-20251101", max_tokens:1024, system:systemPrompt, messages:[...(history||[]).slice(-6),{role:"user",content:message}] });
     const raw = resp.content[0].text.replace(/```json|```/g,"").trim();
     let parsed;
     try { parsed = JSON.parse(raw); } catch { parsed = { action:"info", message:"Non ho capito, puoi riformulare?" }; }
