@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { MongoClient, ObjectId } from "mongodb";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import Anthropic from "@anthropic-ai/sdk";
@@ -13,17 +13,42 @@ app.use(express.static(join(__dirname, "public")));
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const DATA_DIR = process.env.VERCEL ? "/tmp" : __dirname;
-const DB_PATH = join(DATA_DIR, "data.json");
-
-function readDB() {
-  try { if (existsSync(DB_PATH)) return JSON.parse(readFileSync(DB_PATH, "utf8")); } catch(e){}
-  return { tasks: [], clients: [] };
+// ── MongoDB ───────────────────────────────────────────────────────────────────
+let db;
+async function getDB() {
+  if (db) return db;
+  const client = new MongoClient(process.env.MONGODB_URI);
+  await client.connect();
+  db = client.db("czp-agenda");
+  return db;
 }
-function writeDB(data) {
-  try { writeFileSync(DB_PATH, JSON.stringify(data, null, 2)); } catch(e){ console.error("writeDB:", e.message); }
+
+async function readDB() {
+  try {
+    const database = await getDB();
+    const tasks = await database.collection("tasks").find({}).toArray();
+    const clients = await database.collection("clients").find({}).toArray();
+    return { tasks, clients };
+  } catch(e) {
+    console.error("readDB:", e.message);
+    return { tasks: [], clients: [] };
+  }
 }
 
+async function getClient(name) {
+  const database = await getDB();
+  const norm = name.trim();
+  let client = await database.collection("clients").findOne({ nameLower: norm.toLowerCase() });
+  if (!client) {
+    const colors = ["#1a6bcc","#0e8a7a","#7a3db8","#cc6a1a","#1a8a3a","#cc1a5a","#6a7acc"];
+    const count = await database.collection("clients").countDocuments();
+    client = { name: norm, nameLower: norm.toLowerCase(), color: colors[count % colors.length] };
+    await database.collection("clients").insertOne(client);
+  }
+  return client;
+}
+
+// ── Microsoft OAuth ───────────────────────────────────────────────────────────
 let msTokens = null;
 const MS_AUTH_URL = "https://login.microsoftonline.com";
 const MS_SCOPES = ["openid","offline_access","profile","Calendars.ReadWrite","Tasks.ReadWrite"].join(" ");
@@ -59,37 +84,44 @@ async function getAccessToken() {
 app.get("/auth/status", (req, res) => res.json({ connected: !!msTokens }));
 app.get("/auth/logout", (req, res) => { msTokens = null; res.json({ ok: true }); });
 
-app.get("/api/tasks", (req, res) => res.json(readDB()));
-
-app.post("/api/tasks", (req, res) => {
-  const db = readDB();
-  const task = { id: `t_${Date.now()}_${Math.random().toString(36).substr(2,5)}`, ...req.body, done: false, outlookEventId: null, outlookTaskId: null, createdAt: new Date().toISOString() };
-  db.tasks.push(task);
-  const clientName = task.client || "Generale";
-  if (!db.clients.find(c => c.name.toLowerCase() === clientName.toLowerCase())) {
-    const colors = ["#1a6bcc","#0e8a7a","#7a3db8","#cc6a1a","#1a8a3a","#cc1a5a","#6a7acc"];
-    db.clients.push({ name: clientName, color: colors[db.clients.length % colors.length] });
-  }
-  writeDB(db);
-  res.json(task);
+// ── Tasks ─────────────────────────────────────────────────────────────────────
+app.get("/api/tasks", async (req, res) => {
+  try { res.json(await readDB()); } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch("/api/tasks/:id", (req, res) => {
-  const db = readDB();
-  const idx = db.tasks.findIndex(t => t.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error:"not found" });
-  Object.assign(db.tasks[idx], req.body);
-  writeDB(db);
-  res.json(db.tasks[idx]);
+app.post("/api/tasks", async (req, res) => {
+  try {
+    const database = await getDB();
+    const clientName = req.body.client || "Generale";
+    await getClient(clientName);
+    const task = { id: `t_${Date.now()}_${Math.random().toString(36).substr(2,5)}`, ...req.body, client: clientName, done: false, outlookEventId: null, outlookTaskId: null, createdAt: new Date().toISOString() };
+    await database.collection("tasks").insertOne(task);
+    res.json(task);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete("/api/tasks/:id", (req, res) => {
-  const db = readDB();
-  db.tasks = db.tasks.filter(t => t.id !== req.params.id);
-  writeDB(db);
-  res.json({ ok: true });
+app.patch("/api/tasks/:id", async (req, res) => {
+  try {
+    const database = await getDB();
+    const result = await database.collection("tasks").findOneAndUpdate(
+      { id: req.params.id },
+      { $set: req.body },
+      { returnDocument: "after" }
+    );
+    if (!result) return res.status(404).json({ error: "not found" });
+    res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+app.delete("/api/tasks/:id", async (req, res) => {
+  try {
+    const database = await getDB();
+    await database.collection("tasks").deleteOne({ id: req.params.id });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Outlook ───────────────────────────────────────────────────────────────────
 app.post("/api/outlook/event", async (req, res) => {
   const token = await getAccessToken();
   if (!token) return res.status(401).json({ error:"Not connected to Outlook" });
@@ -124,6 +156,7 @@ app.post("/api/outlook/todo", async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── AI Chat ───────────────────────────────────────────────────────────────────
 function addDays(d,n){ const r=new Date(d); r.setDate(r.getDate()+n); return r; }
 function fmtDate(d){ return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
 function nextDow(dow){ const t=new Date(); const diff=(dow-t.getDay()+7)%7||7; return fmtDate(addDays(t,diff)); }
@@ -132,13 +165,13 @@ const DAYS=['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
 app.post("/api/chat", async (req, res) => {
   const { message, history } = req.body;
   if (!message) return res.status(400).json({ error:"missing message" });
-  const db = readDB();
+  const db2 = await readDB();
   const now = new Date();
   const td = fmtDate(now);
   const systemPrompt = `Sei un assistente agenda professionale per Fede, associate presso CZP&Co. (public affairs).
 Oggi è ${td} (${DAYS[now.getDay()]}).
-CLIENTI: ${db.clients.map(c=>c.name).join(", ")||"nessuno"}
-TASK RECENTI: ${JSON.stringify(db.tasks.slice(-15).map(t=>({id:t.id,title:t.title,client:t.client,date:t.date,done:t.done})))}
+CLIENTI: ${db2.clients.map(c=>c.name).join(", ")||"nessuno"}
+TASK RECENTI: ${JSON.stringify(db2.tasks.slice(-15).map(t=>({id:t.id,title:t.title,client:t.client,date:t.date,done:t.done})))}
 Rispondi SOLO con JSON valido (nessun testo fuori, nessun markdown):
 {"action":"add|update|delete|complete|info","tasks":[{"title":"","client":"","date":"YYYY-MM-DD","priority":"alta|media|bassa","tag":"call|meeting|brief|report|deadline|email|draft"}],"taskIds":[],"updates":{},"syncOutlook":true,"message":"risposta breve in italiano"}
 DATE: oggi=${td}, domani=${fmtDate(addDays(now,1))}, dopodomani=${fmtDate(addDays(now,2))}, lunedì=${nextDow(1)}, martedì=${nextDow(2)}, mercoledì=${nextDow(3)}, giovedì=${nextDow(4)}, venerdì=${nextDow(5)}
